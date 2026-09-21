@@ -5,7 +5,7 @@ from PIL import Image
 from io import BytesIO
 from pathlib import Path
 
-from llm_bedrock_anthropic import (
+from llm_bedrock_modern import (
     BedrockClaude, 
     ANTHROPIC_MAX_IMAGE_LONG_SIZE, 
     AttachmentData, 
@@ -17,7 +17,7 @@ FIXTURES_DIR = os.path.join(os.path.dirname(__file__), 'fixtures')
 IMAGES_DIR = os.path.join(FIXTURES_DIR, 'images')
 DOCS_DIR = os.path.join(FIXTURES_DIR, 'documents')
 
-class TestBedrockClaude(BedrockClaude):
+class FakeBedrockClaude(BedrockClaude):
     def execute(self, prompt, stream=False, response=None, **kwargs):
         # Mock implementation for testing
         return "Test response"
@@ -34,11 +34,11 @@ class TestBedrockClaude(BedrockClaude):
 
 @pytest.fixture
 def model():
-    return TestBedrockClaude("anthropic.claude-3-sonnet-20240229-v1:0", supports_attachments=True)
+    return FakeBedrockClaude("anthropic.claude-3-sonnet-20240229-v1:0", supports_attachments=True)
 
 @pytest.fixture
 def model_no_attachments():
-    return TestBedrockClaude("anthropic.claude-v2", supports_attachments=False)
+    return FakeBedrockClaude("anthropic.claude-v2", supports_attachments=False)
 
 def test_attachment_data_properties():
     """Test properties of AttachmentData"""

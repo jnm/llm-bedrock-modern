@@ -1,10 +1,10 @@
 [project]
-name = "llm-bedrock-anthropic"
-version = "0.4.8"
+name = "llm-bedrock-modern"
+version = "0.5.0"
 
-description = "LLM plugin for Anthropic's Claude on AWS Bedrock"
+description = "LLM plugin for Anthropic's Claude on AWS Bedrock, with the model list discovered from your account"
 readme = "README.md"
-authors = [{name = "Sean Blakey"}, {name = "Will Sorenson"}]
+authors = [{name = "Sean Blakey"}, {name = "Will Sorenson"}, {name = "Claude Opus 5"}]
 license = {text = "Apache-2.0"}
 classifiers = [
     "License :: OSI Approved :: Apache Software License"
@@ -17,8 +17,14 @@ dependencies = [
     "pillow >= 10.4.0"
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.urls]
-Homepage = "https://github.com/sblakey/llm-bedrock-anthropic"
+Homepage = "https://github.com/jnm/llm-bedrock-modern"
 
 [project.entry-points.llm]
-bedrock_claude = "llm_bedrock_anthropic"
+bedrock_modern = "llm_bedrock_modern"
+
+[tool.setuptools]
+py-modules = ["llm_bedrock_modern"]

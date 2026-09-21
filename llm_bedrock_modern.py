@@ -1,7 +1,9 @@
 # Imports
 
+import json
 import mimetypes
 import os
+import re
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from io import BytesIO
@@ -9,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Union
 
 import boto3
+import click
 import llm
 from PIL import Image
 from pydantic import Field, field_validator
@@ -52,290 +55,137 @@ MIME_TYPE_TO_BEDROCK_CONVERSE_DOCUMENT_FORMAT = {
 # See: https://docs.anthropic.com/en/docs/build-with-claude/vision
 ANTHROPIC_MAX_IMAGE_LONG_SIZE = 1568
 
+# Where the discovered model list is cached, relative to llm.user_dir().
+CACHE_FILE = "bedrock-anthropic-profiles.json"
+
+DEFAULT_MAX_TOKENS = 16000
+
+# Used only when AWS is unreachable and nothing has been cached yet.
+SEED_PROFILES = ["us.anthropic.claude-opus-5", "us.anthropic.claude-sonnet-5"]
+
+# Models that accept thinking={"type": "adaptive"}. Left with thinking off,
+# these tend to write their reasoning into the visible answer instead.
+ADAPTIVE_THINKING = re.compile(
+    r"claude-(fable|mythos)-\d|claude-opus-(4-[678]|5)|claude-sonnet-(4-6|5)"
+)
+
+# Claude 3-era models reject anything above 4096 output tokens.
+LEGACY_4K = re.compile(r"claude-(instant|v2|3-(sonnet|haiku|opus))")
+
 
 # Much of this code is derived from https://github.com/tomviner/llm-claude
 
 
+def cache_path():
+    return llm.user_dir() / CACHE_FILE
+
+
+def fetch_profiles():
+    """Return sorted IDs of every ACTIVE Anthropic inference profile in the account."""
+    client = boto3.client("bedrock")
+    profiles = []
+    kwargs = {"maxResults": 100}
+    while True:
+        response = client.list_inference_profiles(**kwargs)
+        for summary in response.get("inferenceProfileSummaries", []):
+            profile_id = summary["inferenceProfileId"]
+            if "anthropic" in profile_id and summary.get("status") == "ACTIVE":
+                profiles.append(profile_id)
+        if not response.get("nextToken"):
+            break
+        kwargs["nextToken"] = response["nextToken"]
+    return sorted(set(profiles))
+
+
+def read_cache():
+    path = cache_path()
+    if path.exists():
+        try:
+            return json.loads(path.read_text())["profiles"]
+        except (ValueError, KeyError):
+            pass
+    return None
+
+
+def load_profiles(refresh=False):
+    """The model list, from cache unless asked to refresh.
+
+    Registration must never depend on a live AWS call: it runs on every single
+    llm invocation, and a missing credential or a network hiccup would
+    otherwise take down the whole CLI.
+    """
+    if not refresh:
+        cached = read_cache()
+        if cached is not None:
+            return cached
+    try:
+        profiles = fetch_profiles()
+    except Exception:
+        return read_cache() or list(SEED_PROFILES)
+    cache_path().write_text(json.dumps({"profiles": profiles}, indent=2))
+    return profiles
+
+
+def aliases_for(profile_id):
+    """us.anthropic.claude-opus-5 -> ['bedrock-opus-5', 'bo5']"""
+    region, _, rest = profile_id.partition(".")
+    name = rest.removeprefix("anthropic.").removeprefix("claude-")
+    # Drop Bedrock's version/date suffixes: opus-4-1-20250805-v1:0 -> opus-4-1
+    parts = []
+    for part in name.split("-"):
+        if part.startswith("v") and part[1:].split(":")[0].isdigit():
+            break
+        if len(part) == 8 and part.isdigit():
+            break
+        parts.append(part)
+    name = "-".join(parts)
+    suffix = "" if region == "us" else f"-{region}"
+    aliases = [f"bedrock-{name}{suffix}"]
+    # Short form: family initial + dotted version, e.g. opus-4-6 -> bo4.6
+    family, _, version = name.partition("-")
+    if family and version:
+        aliases.append(f"b{family[0]}{version.replace('-', '.')}{suffix}")
+    return aliases
+
+
 @llm.hookimpl
 def register_models(register):
-    # Claude 2 and earlier models (no attachment support)
-    register(
-        BedrockClaude("anthropic.claude-instant-v1", supports_attachments=False),
-        aliases=("bedrock-claude-instant", "bci"),
-    )
-    register(
-        BedrockClaude("anthropic.claude-v2", supports_attachments=False),
-        aliases=("bedrock-claude-v2-0",),
-    )
-    register(
-        BedrockClaude("anthropic.claude-v2:1", supports_attachments=False),
-        aliases=(
-            "bedrock-claude-v2.1",
-            "bedrock-claude-v2",
-        ),
-    )
+    seen = set()
+    for profile_id in load_profiles():
+        aliases = [alias for alias in aliases_for(profile_id) if alias not in seen]
+        seen.update(aliases)
+        register(BedrockClaude(profile_id, supports_attachments=True), aliases=tuple(aliases))
 
-    # Claude 3 models (with attachment support)
-    register(
-        BedrockClaude(
-            "anthropic.claude-3-sonnet-20240229-v1:0", supports_attachments=True
-        ),
-        aliases=("bedrock-claude-v3-sonnet",),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-3-5-sonnet-20241022-v2:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v3.5-sonnet-v2",
-            "bedrock-claude-sonnet-v2",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-3-5-sonnet-20240620-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v3.5-sonnet",
-            "bedrock-claude-sonnet",
-            "bedrock-sonnet",
-            "bedrock-claude",
-            "bc",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-3-opus-20240229-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v3-opus",
-            "bedrock-claude-opus",
-            "bedrock-opus",
-            "bo",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-3-5-haiku-20241022-v1:0", supports_attachments=False
-        ),
-        aliases=(
-            "bedrock-claude-v3.5-haiku",
-            "bedrock-haiku-v3.5",
-            "bh-v3.5",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-3-haiku-20240307-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v3-haiku",
-            "bedrock-claude-haiku",
-            "bedrock-haiku",
-            "bh",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-haiku-4-5-20251001-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-haiku",
-            "bedrock-claude-haiku-v4.5",
-            "bh-v4.5",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-3-7-sonnet-20250219-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v3.7-sonnet",
-            "bedrock-claude-sonnet-v3.7",
-            "bc-v3.7",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-sonnet-4-20250514-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4-sonnet",
-            "bedrock-claude-sonnet-v4",
-            "bc-v4",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-opus-4-20250514-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4-opus",
-            "bedrock-claude-opus-v4",
-            "bo-v4",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-opus-4-1-20250805-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.1-opus",
-            "bedrock-claude-opus-v4.1",
-            "bo-v4.1",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "anthropic.claude-sonnet-4-5-20250929-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-sonnet",
-            "bedrock-claude-sonnet-v4.5",
-            "bc-v4.5",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-opus-4-1-20250805-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.1-opus-us",
-            "bedrock-claude-opus-v4.1-us",
-            "bo-v4.1-us",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-sonnet-4-5-20250929-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-sonnet-us",
-            "bedrock-claude-sonnet-v4.5-us",
-            "bc-v4.5-us",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-haiku-us",
-            "bedrock-claude-haiku-v4.5-us",
-            "bh-v4.5-us",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "global.anthropic.claude-sonnet-4-20250514-v1:0",
-            supports_attachments=True,
-        ),
-        aliases=(
-            "bedrock-claude-v4-sonnet-global",
-            "bedrock-claude-sonnet-v4-global",
-            "bc-v4-global",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-            supports_attachments=True,
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-sonnet-global",
-            "bedrock-claude-sonnet-v4.5-global",
-            "bc-v4.5-global",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "global.anthropic.claude-haiku-4-5-20251001-v1:0",
-            supports_attachments=True,
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-haiku-global",
-            "bedrock-claude-haiku-v4.5-global",
-            "bh-v4.5-global",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-opus-4-5-20251101-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-opus-us",
-            "bedrock-claude-opus-v4.5-us",
-            "bo-v4.5-us",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-opus-4-6-v1", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.6-opus-us",
-            "bedrock-claude-opus-v4.6-us",
-            "bo-v4.6-us",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "global.anthropic.claude-opus-4-5-20251101-v1:0", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.5-opus-global",
-            "bedrock-claude-opus-v4.5-global",
-            "bo-v4.5-global",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "global.anthropic.claude-opus-4-6-v1", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.6-opus-global",
-            "bedrock-claude-opus-v4.6-global",
-            "bo-v4.6-global",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "us.anthropic.claude-sonnet-4-6", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.6-sonnet-us",
-            "bedrock-claude-sonnet-v4.6-us",
-            "bc-v4.6-us",
-        ),
-    )
-    register(
-        BedrockClaude(
-            "global.anthropic.claude-sonnet-4-6", supports_attachments=True
-        ),
-        aliases=(
-            "bedrock-claude-v4.6-sonnet-global",
-            "bedrock-claude-sonnet-v4.6-global",
-            "bc-v4.6-global",
-        ),
-    )
+
+@llm.hookimpl
+def register_commands(cli):
+    @cli.command(name="bedrock-refresh")
+    def bedrock_refresh():
+        "Refresh the cached list of Anthropic models available on Bedrock"
+        profiles = load_profiles(refresh=True)
+        click.echo(f"Wrote {len(profiles)} profiles to {cache_path()}")
+        for profile_id in profiles:
+            click.echo(f"  {profile_id}  ({', '.join(aliases_for(profile_id))})")
 
 
 class BedrockClaude(llm.Model):
     can_stream: bool = True
 
-    # TODO: expose other Options
     class Options(llm.Options):
-        # TODO: Make the defaults model-specific.
         max_tokens_to_sample: Optional[int] = Field(
             description="The maximum number of tokens to generate before stopping",
-            default=4096,  # Bedrock complained when I passed a higher number into claude v3.5 Sonnet.
+            default=DEFAULT_MAX_TOKENS,  # clamped per-model where Bedrock demands less
         )
         bedrock_model_id: Optional[str] = Field(
             description="Bedrock modelId or ARN of base, custom, or provisioned model",
             default=None,
         )
-        bedrock_attach: Optional[str] = Field(
-            description="Attach the given image or document file (or files, separated by comma) to the prompt.",
+        thinking: Optional[str] = Field(
+            description="Thinking mode: auto (on where supported), adaptive, or off",
+            default="auto",
+        )
+        effort: Optional[str] = Field(
+            description="Reasoning effort: low, medium, high, xhigh or max",
             default=None,
         )
 
@@ -562,33 +412,13 @@ class BedrockClaude(llm.Model):
     def prompt_to_content(self, prompt):
         """
         Convert a llm.Prompt object to the content format expected by the Bedrock Converse API.
-        If we encounter the bedrock_attach_files option, detect the file type(s) and use the
-        proper Bedrock Converse content type to attach the file(s) to the prompt.
 
         :param prompt: A llm Prompt objet.
         :return: A content object that conforms to the Bedrock Converse API.
         """
         content = []
 
-        # Legacy attachments with -o bedrock_attach
-        if prompt.options.bedrock_attach:
-            # Support multiple files separated by comma.
-            for file_path in prompt.options.bedrock_attach.split(","):
-                mime_type, _ = mimetypes.guess_type(file_path)
-                if not mime_type:
-                    raise ValueError(f"Unable to guess mime type for file: {file_path}")
-
-                file_path = os.path.expanduser(file_path)
-                if mime_type.startswith("image/"):
-                    content.append(self.image_path_to_content_block(file_path))
-                elif mime_type in MIME_TYPE_TO_BEDROCK_CONVERSE_DOCUMENT_FORMAT:
-                    content.append(
-                        self.document_path_to_content_block(file_path, mime_type)
-                    )
-                else:
-                    raise ValueError(f"Unsupported file type for file: {file_path}")
-
-        # Modern attachments with -a or --attachment
+        # Attachments with -a or --attachment
         if hasattr(prompt, "attachments"):
             data = [self.create_attachment_data(a) for a in prompt.attachments]
             content_blocks = [self.process_attachment(d) for d in data]
@@ -644,7 +474,51 @@ class BedrockClaude(llm.Model):
         else:
             return o
 
+    def messages_from_chain(self, prompt) -> Optional[List[dict]]:
+        """
+        Build Bedrock Converse messages from llm's canonical message chain.
+
+        `prompt.messages` is the authoritative history in llm 0.32+, populated
+        from the content-addressed log tables when resuming with `llm -c`.
+        build_messages() below instead walks `conversation.responses`, which
+        those versions no longer populate - so relying on it silently sends no
+        history at all.
+
+        :param prompt: A llm Prompt object.
+        :return: Bedrock Converse messages, or None on llm versions that
+                 predate the message chain, so the caller can fall back.
+        """
+        try:
+            chain = prompt.messages
+        except AttributeError:
+            return None
+        if not chain:
+            return None
+
+        messages = []
+        for message in chain:
+            if message.role == "system":
+                # Carried by the top-level `system` parameter instead.
+                continue
+            content = []
+            for part in message.parts:
+                if getattr(part, "type", None) == "reasoning":
+                    # Bedrock rejects replayed reasoning without its signature.
+                    continue
+                text = getattr(part, "text", None)
+                if text:
+                    content.append({"text": text})
+                attachment = getattr(part, "attachment", None)
+                if attachment is not None:
+                    content.append(
+                        self.process_attachment(self.create_attachment_data(attachment))
+                    )
+            if content:
+                messages.append({"role": message.role, "content": content})
+        return messages or None
+
     def build_messages(self, prompt_content, conversation) -> List[dict]:
+        """Legacy history reconstruction, for llm versions before 0.32."""
         messages = []
         if conversation:
             for response in conversation.responses:
@@ -668,26 +542,27 @@ class BedrockClaude(llm.Model):
         messages.append({"role": "user", "content": prompt_content})
         return messages
 
+    def additional_request_fields(self, prompt) -> dict:
+        """
+        Model-specific Converse fields for thinking and reasoning effort. Left
+        with thinking off, current models tend to write their reasoning into
+        the visible answer, so it is enabled by default where supported.
+        """
+        extra = {}
+        thinking = (prompt.options.thinking or "auto").lower()
+        if thinking == "auto":
+            thinking = "adaptive" if ADAPTIVE_THINKING.search(self.model_id) else "off"
+        if thinking != "off":
+            extra["thinking"] = {"type": thinking}
+        if prompt.options.effort:
+            extra["output_config"] = {"effort": prompt.options.effort}
+        return extra
+
     def execute(self, prompt, stream, response, conversation):
-        # Claude 2.0 and Claude Instant did not historically really support system prompts:
-        # https://docs.anthropic.com/claude/docs/constructing-a-prompt#system-prompt-optional
-        #
-        # As of the release of the Messages API, this seems like it has been fixed
-        # https://docs.anthropic.com/claude/docs/system-prompts, but it is not documented that
-        # Claude Instant and 2.0 support it (and the wording implies that it doesn't)
-        # so what we do instead is put what would be the system prompt in the first line of the
-        # `Human` prompt, as recommended in the documentation. This enables us to effectively use the
-        #  `-s`, `-t` and `--save` flags.
-        bedrock_model_id = prompt.options.bedrock_model_id or self.model_id
-
-        if prompt.system and self.model_id in [
-            "anthropic.claude-v2",
-            "anthropic.claude-instant-v1",
-        ]:
-            prompt.prompt = prompt.system + "\n" + prompt.prompt
-
         prompt_content = self.prompt_to_content(prompt)
-        messages = self.build_messages(prompt_content, conversation)
+        messages = self.messages_from_chain(prompt)
+        if messages is None:
+            messages = self.build_messages(prompt_content, conversation)
 
         # Preserve the Bedrock-specific user content dict, so it can be re-used in
         # future conversations.
@@ -695,17 +570,23 @@ class BedrockClaude(llm.Model):
             "bedrock_user_content": self.encode_bytes(prompt_content)
         }
 
-        inference_config = {"maxTokens": prompt.options.max_tokens_to_sample}
+        max_tokens = prompt.options.max_tokens_to_sample
+        if LEGACY_4K.search(self.model_id):
+            max_tokens = min(max_tokens, 4096)
 
         # Put together parameters for the Bedrock Converse API.
         params = {
-            "modelId": bedrock_model_id,
+            "modelId": prompt.options.bedrock_model_id or self.model_id,
             "messages": messages,
-            "inferenceConfig": inference_config,
+            "inferenceConfig": {"maxTokens": max_tokens},
         }
 
         if prompt.system:
             params["system"] = [{"text": prompt.system}]
+
+        extra = self.additional_request_fields(prompt)
+        if extra:
+            params["additionalModelRequestFields"] = extra
 
         client = boto3.client("bedrock-runtime")
         if stream:
@@ -715,15 +596,19 @@ class BedrockClaude(llm.Model):
             for event in bedrock_response["stream"]:
                 ((event_type, event_content),) = event.items()
                 if event_type == "contentBlockDelta":
-                    completion = event_content["delta"]["text"]
-                    yield completion
+                    delta = event_content["delta"]
+                    # Reasoning deltas carry no "text"; they stay in the log
+                    # but are not part of the visible answer.
+                    if "text" in delta:
+                        yield delta["text"]
                 events.append(event)
             response.response_json["stream"] = events
         else:
             bedrock_response = client.converse(**params)
-            completion = bedrock_response["output"]["message"]["content"][-1]["text"]
             response.response_json |= bedrock_response
-            yield completion
+            blocks = bedrock_response["output"]["message"]["content"]
+            # Skip reasoningContent blocks; join whatever text blocks remain.
+            yield "".join(block["text"] for block in blocks if "text" in block)
         self.set_usage(response)
 
     def set_usage(self, response: llm.Response):
