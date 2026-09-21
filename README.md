@@ -111,6 +111,10 @@ llm install -e '.[test]'
 python -m pytest
 ```
 
+See [MAINTENANCE.md](MAINTENANCE.md) for the parts that need attention when new
+models ship, the invariants the tests protect, and where this plugin is coupled
+to `llm`'s internals.
+
 ## Credits
 
 Original plugin by Sean Blakey and Will Sorenson, itself derived from
